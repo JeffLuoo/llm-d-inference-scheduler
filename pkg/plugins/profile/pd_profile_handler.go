@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/plugins"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/scheduling/framework"
@@ -91,8 +93,10 @@ func (h *PdProfileHandler) WithName(name string) *PdProfileHandler {
 // previously executed cycles along with their results.
 func (h *PdProfileHandler) Pick(ctx context.Context, cycleState *types.CycleState, request *types.LLMRequest, profiles map[string]*framework.SchedulerProfile,
 	profileResults map[string]*types.ProfileRunResult) map[string]*framework.SchedulerProfile {
+	startTime := time.Now()
 	if _, executed := profileResults[h.decodeProfile]; !executed {
 		// if decode profile was not executed yet, first let the scheduler run the decode profile
+		defer func() { metrics.RecordDecodeSelectionDuration(time.Since(startTime)) }()
 		return map[string]*framework.SchedulerProfile{
 			h.decodeProfile: profiles[h.decodeProfile],
 		}
@@ -130,11 +134,15 @@ func (h *PdProfileHandler) Pick(ctx context.Context, cycleState *types.CycleStat
 
 		if (1.0-hitPercentagePrefix)*float64(len(userInput)) < float64(h.pdThreshold) {
 			log.FromContext(ctx).Info("Non-cached suffix is smaller than threshold, using decode profile only", "hitPercentage", hitPercentagePrefix)
+			metrics.IncPDThresholdHitsCounter(h.pdThreshold)
+			metrics.RecordPDDecisionCounter("combined")
 			return map[string]*framework.SchedulerProfile{} // do not run prefill
 		}
 	}
 
+	metrics.RecordPDDecisionCounter("split")
 	// run the prefill profile
+	defer func() { metrics.RecordPrefillSelectionDuration(time.Since(startTime)) }()
 	return map[string]*framework.SchedulerProfile{
 		h.prefillProfile: profiles[h.prefillProfile],
 	}
@@ -145,6 +153,8 @@ func (h *PdProfileHandler) Pick(ctx context.Context, cycleState *types.CycleStat
 // an error while running the profile.
 func (h *PdProfileHandler) ProcessResults(_ context.Context, _ *types.CycleState, _ *types.LLMRequest,
 	profileResults map[string]*types.ProfileRunResult) (*types.SchedulingResult, error) {
+	startTime := time.Now()
+
 	if profileResults[h.decodeProfile] == nil { // if decode profile failed to run, we should fail
 		return nil, errors.New("failed to find available decode workers")
 	}
@@ -152,13 +162,15 @@ func (h *PdProfileHandler) ProcessResults(_ context.Context, _ *types.CycleState
 
 	// if both prefill and decode ran successfully
 	if prefillRunResult, exists := profileResults[h.prefillProfile]; exists && prefillRunResult != nil {
+		metrics.RecordRequestDurationByDecision(time.Since(startTime), "split")
 		return &types.SchedulingResult{
 			PrimaryProfileName: h.decodeProfile,
 			ProfileResults:     profileResults,
 		}, nil
 	}
 
-	// otherwise, decode ran successfully and prefill failed. filter out prefill from the returned results.
+	// otherwise, decode ran successfully and prefill failed or was not run.
+	metrics.RecordRequestDurationByDecision(time.Since(startTime), "combined")
 	return &types.SchedulingResult{
 		PrimaryProfileName: h.decodeProfile,
 		ProfileResults: map[string]*types.ProfileRunResult{
